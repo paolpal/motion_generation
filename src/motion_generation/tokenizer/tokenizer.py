@@ -1,6 +1,7 @@
 import json
-from typing import Dict, Optional
-
+from pathlib import Path
+from typing import Dict, Optional, Union
+from gensim.models.keyedvectors import KeyedVectors
 
 class Word2VecTokenizer:
     """
@@ -47,7 +48,7 @@ class Word2VecTokenizer:
     # FACTORY: TRAIN
     # ----------------
     @classmethod
-    def from_word2vec(cls, word2vec):
+    def from_word2vec(cls, word2vec: KeyedVectors):
         """
         Costruisce il tokenizer a partire da Word2Vec.
         Da usare SOLO in preprocessing.
@@ -84,12 +85,15 @@ class Word2VecTokenizer:
     # ----------------
     # SERIALIZZAZIONE
     # ----------------
-    def save(self, path: str):
+    def save(self, path: Union[str, Path]):
         """
         Salva tokenizer + metadata.
         """
+        if isinstance(path, str):
+            path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "type": "WordTokenizer",
+            "type": "Word2VecTokenizer",
             "version": self.version,
             "special_tokens": self.SPECIAL_TOKENS,
             "stoi": self.stoi,
@@ -103,12 +107,14 @@ class Word2VecTokenizer:
     # DESERIALIZZAZIONE
     # ----------------
     @classmethod
-    def load(cls, path: str, expected_version: Optional[str] = None):
+    def load(cls, path: Union[str, Path], expected_version: Optional[str] = None):
+        if isinstance(path, str):
+            path = Path(path)
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
         # ---- controlli di sicurezza
-        assert payload["type"] == "WordTokenizer", "Tipo tokenizer errato"
+        assert payload["type"] == "Word2VecTokenizer", "Tipo tokenizer errato"
 
         version = payload["version"]
         if expected_version is not None:

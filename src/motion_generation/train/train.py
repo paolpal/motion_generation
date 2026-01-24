@@ -1,3 +1,10 @@
+import os
+
+import wandb
+
+from motion_generation.embedding import Word2VecWeightFactory
+os.environ["GENSIM_DATA_DIR"] = "/home/ubuntu/palumbo/Posemi/dataset/gensim_data"
+import gensim.downloader as api
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -5,14 +12,17 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
 from tqdm import tqdm
-import argparse
 
-from motion_generation.models.gesture import GestureTransformer
-from motion_generation.dataset.transcript_pose import TranscriptPoseDataset, transcript_motion_collate_fn
-from motion_generation.embedding import Word2VecEmbedder
-from motion_quantization.quantization import PoseQuantizer
+from motion_generation.models import GestureTransformer
+from motion_generation.dataset import TranscriptPoseDataset, transcript_motion_collate_fn
+
+
 from motion_quantization.models import SkeletonVQVAE
+from motion_quantization.quantization import PoseTokenizer
+from motion_generation.tokenizer import Word2VecTokenizer
 
+PRJ_ROOT = Path("/home/ubuntu/palumbo/Posemi/")
+WANDB_API_KEY = "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"
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch):
     model.train()
@@ -21,11 +31,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch):
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch in pbar:
         # Move to device
-        encoder_input = batch['encoder_input'].to(device)           # (B, T, 300)
-        decoder_input = batch['decoder_input'].to(device)           # (B, M)
-        decoder_target = batch['decoder_target'].to(device)         # (B, M)
-        encoder_padding_mask = batch['encoder_padding_mask'].to(device)
-        decoder_padding_mask = batch['decoder_padding_mask'].to(device)
+        encoder_input = batch['text_tokens'].to(device)           # (B, T, 300)
+        decoder_input = batch['motion_tokens'][:, :-1].to(device)           # (B, M)
+        decoder_target = batch['motion_tokens'][:, 1:].to(device)         # (B, M)
+        encoder_padding_mask = batch['text_mask'].to(device)
+        decoder_padding_mask = batch['motion_mask'][:, 1:].to(device)
         
         optimizer.zero_grad()
         
@@ -59,11 +69,11 @@ def validate(model, dataloader, criterion, device):
     total_loss = 0.0
     
     for batch in tqdm(dataloader, desc="Validation"):
-        encoder_input = batch['encoder_input'].to(device)
-        decoder_input = batch['decoder_input'].to(device)
-        decoder_target = batch['decoder_target'].to(device)
-        encoder_padding_mask = batch['encoder_padding_mask'].to(device)
-        decoder_padding_mask = batch['decoder_padding_mask'].to(device)
+        encoder_input = batch['text_tokens'].to(device)
+        decoder_input = batch['motion_tokens'][:, :-1].to(device)
+        decoder_target = batch['motion_tokens'][:, 1:].to(device)
+        encoder_padding_mask = batch['text_mask'].to(device)
+        decoder_padding_mask = batch['motion_mask'][:, 1:].to(device)
         
         logits = model(
             src=encoder_input,
@@ -81,129 +91,165 @@ def validate(model, dataloader, criterion, device):
     return total_loss / len(dataloader)
 
 
-def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def main(config):
+
+    run = wandb.init(
+        project="gesture_transformer", 
+        config=config, 
+    )
+
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # ===== 1. Carica Quantizer e Tokenizer =====
-    print("Loading PoseQuantizer...")
-    model = SkeletonVQVAE.load("/home/paolo/Projects/Posemi/motion_quantization/scripts/weights/vqvae_trial_8.pt")
-    model.to(device)
-    pose_quantizer = PoseQuantizer(model=model, device=device)
-    
-    print("Loading Word2Vec Embedder...")
-    tokenizer = Word2VecEmbedder()
-    
-    # Calcola vocab_size: codebook + 3 token speciali (PAD, BOS, EOS)
-    vocab_size = pose_quantizer.codebook.size(0) + 3
-    print(f"Vocab size: {vocab_size} (codebook: {pose_quantizer.codebook.size(0)} + 3 special tokens)")
-    
+    # ===== 1. Carica Pose e Text Tokenizer e Text Embedding =====
+
+    vqvae = SkeletonVQVAE.load(config['pose_tokenizer_path'])
+    pose_tokenizer = PoseTokenizer(vqvae)
+    w2v = api.load("word2vec-google-news-300")
+    text_tokenizer = Word2VecTokenizer.from_word2vec(w2v) #type:ignore
+
+    # 3. Crei il layer per il tuo Transformer
+    factory = Word2VecWeightFactory(text_tokenizer, w2v)
+    text_embedding = factory.get_nn_embedding(freeze=True)
     # ===== 2. Crea Dataset e DataLoader =====
     print("Loading datasets...")
     train_dataset = TranscriptPoseDataset(
-        speakers=args.speakers,
-        data_root=args.data_root,
-        pose_quantizer=pose_quantizer,
-        tokenizer=tokenizer,
-        split="train"
+        speakers=config['speakers'],
+        data_root=config['data_root'],
+        pose_tokenizer=pose_tokenizer,
+        text_tokenizer=text_tokenizer,
+        split="train",
+        cache_path=config['caches_path']
     )
     
     val_dataset = TranscriptPoseDataset(
-        speakers=args.speakers,
-        data_root=args.data_root,
-        pose_quantizer=pose_quantizer,
-        tokenizer=tokenizer,
-        split="dev"
+        speakers=config['speakers'],
+        data_root=config['data_root'],
+        pose_tokenizer=pose_tokenizer,
+        text_tokenizer=text_tokenizer,
+        split="dev",
+        cache_path=config['caches_path']
     )
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=transcript_motion_collate_fn,
-        num_workers=args.num_workers,
+        num_workers=config['num_workers'],
         pin_memory=True
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=config['batch_size'],
         shuffle=False,
         collate_fn=transcript_motion_collate_fn,
-        num_workers=args.num_workers,
+        num_workers=config['num_workers'],
         pin_memory=True
     )
     
     # ===== 3. Crea Modello =====
     print("Creating GestureTransformer model...")
     model = GestureTransformer(
-        vocab_size=vocab_size,
-        d_text=300,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=args.num_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout
+        text_embedding=text_embedding,
+        transcript_vocab_size=text_tokenizer.vocab_size,
+        pose_vocab_size=pose_tokenizer.vocab_size,
+        d_model=text_embedding.embedding_dim,
+        nhead=config['nhead'],
+        num_encoder_layers=config['num_layers'],
+        num_decoder_layers=config['num_layers'],
+        dim_feedforward=config['dim_feedforward'],
+        dropout=config['dropout'],
+        look_ahead_steps=config['look_ahead_steps'],
+        max_seq_len=config['max_seq_len']
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # ===== 4. Optimizer, Scheduler, Loss =====
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    optimizer = AdamW(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
+    scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
     
     # CrossEntropy con ignore_index per ignorare i token di padding
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # PAD_TOKEN = 0
     
     # ===== 5. Training Loop =====
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
     best_val_loss = float('inf')
-    
-    for epoch in range(1, args.epochs + 1):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch}/{args.epochs}")
-        print(f"{'='*50}")
+    epochs_no_improve = 0
+    patience = 15
+    try:
+        for epoch in range(1, config['epochs'] + 1):
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch}/{config['epochs']}")
+            print(f"{'='*50}")
+            
+            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+            val_loss = validate(model, val_loader, criterion, device)
+            
+            scheduler.step()
+            
+            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Salva checkpoint
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                model.save(output_dir / "best_model.pt")
+                print(f"✓ New best model saved! Val Loss: {val_loss:.4f}")
+            else:
+                epochs_no_improve += 1
+            
+            # Salva checkpoint periodico
+            if epoch % config['save_every'] == 0:
+                model.save(output_dir / f"checkpoint_epoch_{epoch}.pt")
+            
+            if epochs_no_improve >= patience:
+                print(f"Train stopped at epoch {epoch}")
+                break
+
+            run.log({
+                "Train Loss": train_loss,
+                "Val Loss": val_loss,
+                "Learning Rate": scheduler.get_last_lr()[0],
+            })
         
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
-        val_loss = validate(model, val_loader, criterion, device)
-        
-        scheduler.step()
-        
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
-        
-        # Salva checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            model.save(output_dir / "best_model.pt")
-            print(f"✓ New best model saved! Val Loss: {val_loss:.4f}")
-        
-        # Salva checkpoint periodico
-        if epoch % args.save_every == 0:
-            model.save(output_dir / f"checkpoint_epoch_{epoch}.pt")
-    
-    # Salva modello finale
-    model.save(output_dir / "final_model.pt")
-    print(f"\nTraining completed! Best Val Loss: {best_val_loss:.4f}")
+        # Salva modello finale
+        model.save(output_dir / "final_model.pt")
+        print(f"\nTraining completed! Best Val Loss: {best_val_loss:.4f}")
+    finally:
+        run.finish()
 
 
 if __name__ == "__main__":
-    args = {
-        'speakers': ['speaker1', 'speaker2'],  # Esempio di speaker
-        'data_root': '/path/to/data',          # Percorso ai dati
+    speakers = [ "almaram", "chemistry", "corden", "huckabee", "lec_evol", "maher", "oliver", "shelly", "ytch_prof",
+        "angelica",  "colbert", "ellen", "jon", "lec_hist", "minhaj", "rock", "ytch_charisma",
+        "bee", "conan", "fallon", "lec_cosmic", "lec_law", "noah", "seth", "ytch_dating"
+        ]
+    config = {
+        'speakers': speakers,
+        'data_root': PRJ_ROOT / 'dataset/pats/data',          # Percorso ai dati
+        'pose_tokenizer_path': PRJ_ROOT / 'weights/vqvae/vqvae_trial_8.pt',
+        'text_tokenizer_path': PRJ_ROOT / 'caches/tokenizers/word2vec_tokenizer.json',
+        'caches_path': PRJ_ROOT / 'caches/dataset/',
+        'max_seq_len': 500,
         'batch_size': 16,
         'num_workers': 4,
-        'd_model': 512,
-        'nhead': 8,
-        'num_layers': 6,
-        'dim_feedforward': 2048,
+        'nhead': 6,
+        'num_layers': 4,
+        'dim_feedforward': 768,
         'dropout': 0.1,
         'lr': 1e-4,
         'weight_decay': 1e-5,
-        'epochs': 50,
-        'output_dir': './gesture_transformer_output',
-        'save_every': 10
+        'epochs': 100,
+        'output_dir': PRJ_ROOT / 'weights/gesture_transformer/',
+        'save_every': 10,
+        'look_ahead_steps': 3,
     }
-    main(args)
+
+    wandb.login(key=WANDB_API_KEY)
+
+    main(config)

@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import torch.nn as nn
 import math
@@ -29,6 +30,7 @@ class GestureTransformer(nn.Module):
         self, 
         transcript_vocab_size: int,
         pose_vocab_size: int,
+        text_embedding: Optional[nn.Embedding] = None,
         d_model: int = 300,
         nhead: int = 8,
         num_encoder_layers: int = 6,
@@ -39,6 +41,11 @@ class GestureTransformer(nn.Module):
         max_seq_len: int = 5000
     ):
         super().__init__()
+
+        assert text_embedding is not None and text_embedding.embedding_dim == d_model, \
+            "The Embedding for text must match the model's d_model."
+        assert text_embedding is not None and text_embedding.num_embeddings == transcript_vocab_size, \
+            "The Embedding for text must match the transcript_vocab_size."
         
         # Salva la config per save/load
         self.config = {
@@ -56,9 +63,9 @@ class GestureTransformer(nn.Module):
         self.look_ahead_steps = look_ahead_steps
         
         # 1. Embedding & Proiezioni
-        self.text_embedding = nn.Embedding(transcript_vocab_size, d_model)
+        self.text_embedding = text_embedding if text_embedding is not None else nn.Embedding(transcript_vocab_size, d_model)
         self.pose_embedding = nn.Embedding(pose_vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_seq_len)
+        self.pos_encoder = PositionalEncoding(d_model, max_len=max_seq_len)
         
         # 2. Transformer Core
         self.transformer = nn.Transformer(

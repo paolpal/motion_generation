@@ -16,13 +16,17 @@ from typing import List, Optional, Tuple, Union, Literal, Dict
 
 
 class TranscriptPoseDataset(Dataset):
+    @torch.no_grad()
     def __init__(self, 
                  speakers: List[str],
                  data_root: Union[str, Path],
                  pose_tokenizer: PoseTokenizer, 
                  text_tokenizer: Word2VecTokenizer, 
+                 max_len: Optional[int] = 400,
+                 overlap: int = 100,
                  split: Literal["train", "dev", "test"] = "train",
-                 cache_path: Optional[Union[str, Path]] = None):
+                 cache_path: Optional[Union[str, Path]] = None,
+                 force_rebuild: bool = False):
         """
         Dataset con supporto per caching automatico.
         """
@@ -30,56 +34,82 @@ class TranscriptPoseDataset(Dataset):
         self.data_root = Path(data_root)
         self.pose_tokenizer = pose_tokenizer
         self.text_tokenizer = text_tokenizer
-        
+        self.max_len = max_len
+        self.overlap = overlap
+
+        pose_tokenizer.model.eval()
+        pose_tokenizer.codebook.detach()
+
         # 1. Tentativo di caricamento dalla cache
         if cache_path is not None:
-            cache_path = Path(cache_path)
-            if cache_path.exists():
-                print(f"--- Caricamento cache da {cache_path} ---")
-                checkpoint = torch.load(cache_path)
-                self.data = checkpoint['data']
-                # Opzionale: verifica se gli speaker nel file coincidono con quelli richiesti
-                return # Esci dal costruttore se caricamento completato
+            if isinstance(cache_path, str):
+                cache_path = Path(cache_path)
+            spk_hash = "_".join(self.speakers[:3]) + f"_etc_{len(self.speakers)}"
+            self.cache_file = cache_path / f"{spk_hash}_{split}.pt"
+        else:
+            self.cache_file = None
 
-        # 2. Se la cache non esiste o non è stata passata, esegui il processing
-        print(f"--- Cache non trovata. Avvio processing per {split} ---")
-        samples = self._load_raw_dataset_parallel(split)
-        self.data = self._build_tokenized_samples(samples)
+
+        if (
+            self.cache_file is not None and
+            self.cache_file.exists() and
+            not force_rebuild
+        ):
+            print(f"Caricamento cache: {self.cache_file}")
+            self.data = torch.load(self.cache_file, weights_only=False)
+        else:
+        
+            print(f"--- Cache non trovata. Avvio processing per {split} ---")
+            samples = self._load_raw_dataset_parallel(split)
+            self.data = self._build_tokenized_samples(samples)
+            if self.max_len is not None:
+                self.data = self._build_windowed_samples(self.data)
+
+            self.data = self._add_special_tokens(self.data)
+            
 
         # 3. Salvataggio automatico se richiesto
-        if cache_path is not None:
-            self.save(cache_path)
-
+        if self.cache_file is not None and (not self.cache_file.exists() or force_rebuild):
+            self.save(self.cache_file)
+    
     @staticmethod
-    def _load_raw_speaker_samples(speaker: str, split: str, data_root: Path) -> List[Dict]:
-        """Eseguito in processi separati per velocizzare l'I/O e la normalizzazione."""
-        intervals = get_speaker_intervals(speaker=speaker, split=split, data_root=data_root)
-        raw_samples = load_multiple_samples(speaker=speaker, interval_ids=intervals, data_root=data_root)
-
-        samples: List[Dict] = []
-        for s in raw_samples:
-            pose = s['pose']
-            # Centering e Normalizzazione
-            pose[:, 0] = [0.0, 0.0] 
-            pose = Skeleton2D.normalize_skeleton(pose)
-            
-            samples.append({
-                'text': s['text'],
-                'words': s['words'],
-                'n_frames': s['n_frames'],
-                'pose': pose # Restituisce numpy per evitare problemi di serializzazione
-            })
-        return samples
+    def _load_sample(speaker: str, interval_id: str, data_root: Path) -> Optional[Dict]:
+        """Carica un singolo campione (usato per il caricamento parallelo)."""
+        try:
+            sample = load_multiple_samples(speaker=speaker, interval_ids=[interval_id], data_root=data_root)[0]
+        except Exception as e:
+            return None
+        pose = sample['pose']
+        # Centering e Normalizzazione
+        pose[:, 0] = [0.0, 0.0] 
+        pose = Skeleton2D.normalize_skeleton(pose)
+        
+        return {
+            'text': sample['text'],
+            'words': sample['words'],
+            'n_frames': sample['n_frames'],
+            'pose': pose # Restituisce numpy per evitare problemi di serializzazione
+        }
 
     @torch.no_grad()
     def _load_raw_dataset_parallel(self, split: str) -> List[Dict]:
         print(f"--- Caricamento {split} set in corso (Parallelized) ---")
+        speaker_intervals : List[Dict[str, str]] = []
+        for s in tqdm(self.speakers, desc=f"Loading {split}"):
+            intervals = get_speaker_intervals(speaker=s, split=split, data_root=self.data_root)
+            for interval_id in intervals:
+                speaker_intervals.append({
+                    'speaker': s,
+                    'sample_id': interval_id
+                })
         all_samples: List[Dict] = []
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            futures = [executor.submit(self._load_raw_speaker_samples, s, split, self.data_root) for s in self.speakers]
+            futures = [executor.submit(TranscriptPoseDataset._load_sample, s['speaker'], s['sample_id'], self.data_root) for s in speaker_intervals]
             for future in tqdm(as_completed(futures), total=len(futures), desc=f"Loading {split}"):
                 try:
-                    all_samples.extend(future.result())
+                    sample = future.result()
+                    if sample is not None:
+                        all_samples.append(sample)
                 except Exception as e:
                     print(f"Errore caricamento speaker: {e}")
         return all_samples
@@ -87,6 +117,7 @@ class TranscriptPoseDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
     
+    @torch.no_grad()
     def encode_text_framewise(self, words: List[Dict], length: int) -> torch.Tensor:
         """
         Tokenizza il testo frame-aligned in embedding densi.
@@ -101,16 +132,17 @@ class TranscriptPoseDataset(Dataset):
         for w in words:
             text_tokens[int(w['start']):int(w['end'])] = self.text_tokenizer.encode(w['word'])
 
-        return text_tokens
+        return text_tokens.detach()
     
-    def _build_tokenized_samples(self, samples: List[Dict]) -> List[Dict[str, torch.Tensor]]:
+    @torch.no_grad()
+    def _build_tokenized_samples(self, samples: List[Dict]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Processa una lista di campioni: tokenizza il testo e quantizza la pose.
         
         Args:
             samples: Lista di dizionari con 'words', 'n_frames', 'pose'.
         Returns:
-            Dizionario con 'text_tokens' e 'motion_tokens'.
+            Lista di tuple (text_tokens, motion_tokens).
         """
         processed_samples = []
         for idx, sample in enumerate(tqdm(samples, desc="Processing Samples")):
@@ -122,23 +154,57 @@ class TranscriptPoseDataset(Dataset):
             pose_tensor = pose_tensor.reshape(-1, 104)  
             # Il quantizer si aspetta (B, T, J, C)
             _, indices = self.pose_tokenizer.quantize(pose_tensor)
-            indices = indices.cpu() # (T_quantized)
+            indices = indices.detach().cpu() # (T_quantized)
 
             # 3. Preparazione Sequenza Finale: [BOS] + [Tokens + OFFSET] + [EOS]
-            motion_tokens = self.pose_tokenizer.add_special_tokens(indices.unsqueeze(0), add_som=True, add_eom=True).squeeze(0)
-            processed_samples.append({
-                'text_tokens': text_tokens,
-                'motion_tokens': motion_tokens
-            })
+            motion_tokens = indices # self.pose_tokenizer.add_special_tokens(indices.unsqueeze(0), add_som=True, add_eom=False).squeeze(0)
+            processed_samples.append((text_tokens, motion_tokens))
         return processed_samples
+    
+    def _add_special_tokens(self, data : List[Tuple[torch.Tensor, torch.Tensor]]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        processed_data : List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for sample in data:
+            text_tokens, motion_tokens = sample
+            # Aggiungi special tokens
+            motion_tokens = self.pose_tokenizer.add_special_tokens(motion_tokens.unsqueeze(0), add_som=True, add_eom=False).squeeze(0)   
+            processed_data.append((text_tokens, motion_tokens))
+        return processed_data
+
+    @torch.no_grad()
+    def _build_windowed_samples(self, samples) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        assert self.max_len is not None, "max_len deve essere specificato per il windowing."
+        max_len = self.max_len
+        overlap = self.overlap
+        step = self.max_len - overlap
+        windowed_samples = []
+        for sample in tqdm(samples, desc="Building Windowed Samples"):
+            full_text_tokens, full_motion_tokens = sample
+        
+            # Se la sequenza è già corta, la teniamo così com'è
+            if len(full_text_tokens) <= max_len:
+                windowed_samples.append((full_text_tokens, full_motion_tokens))
+            else:
+        
+                # Se è lunga, facciamo sliding window
+                for i in range(0, len(full_text_tokens) - max_len + 1, step):
+                    t_chunk = full_text_tokens[i : i + max_len]
+                    m_chunk = full_motion_tokens[i : i + max_len]
+                    windowed_samples.append((t_chunk, m_chunk))
+                
+                # Gestiamo l'ultimo pezzo se è rimasto fuori (opzionale)
+                if len(full_text_tokens) % step != 0:
+                    t_chunk = full_text_tokens[-max_len:]
+                    m_chunk = full_motion_tokens[-max_len:]
+                    windowed_samples.append((t_chunk, m_chunk))
+            
+        return windowed_samples
         
 
     @torch.no_grad()
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        sample = self.data[idx]
-        return sample['text_tokens'], sample['motion_tokens']
+        return self.data[idx]
 
-
+    
     def save(self, save_path: Union[str, Path]):
         """
         Salva i dati processati e i metadati in un file .pt.
@@ -146,47 +212,42 @@ class TranscriptPoseDataset(Dataset):
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
-        data_to_save = {
-            'data': self.data,
-            'metadata': {
-                'speakers': self.speakers,
-                'data_root': str(self.data_root),
-                # Salviamo i parametri del tokenizer se necessario, 
-                # o almeno la loro configurazione
-            }
-        }
-        
         print(f"--- Salvataggio dataset in {save_path} ---")
-        torch.save(data_to_save, save_path)
+        torch.save(self.data, save_path)
         print("Salvataggio completato.")
+    
 
-    @classmethod
-    def load(cls, 
-             load_path: Union[str, Path], 
-             pose_tokenizer: PoseTokenizer, 
-             text_tokenizer: Word2VecTokenizer) -> 'TranscriptPoseDataset':
-        """
-        Carica un dataset pre-processato senza rieseguire la tokenizzazione.
-        """
-        load_path = Path(load_path)
-        if not load_path.exists():
-            raise FileNotFoundError(f"Nessun file trovato in {load_path}")
+def transcript_motion_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    Collate function per batching di (text_tokens, motion_tokens).
+    Esegue il padding dinamico su entrambe le sequenze.
 
-        print(f"--- Caricamento dataset da {load_path} ---")
-        checkpoint = torch.load(load_path)
-        
-        # Creiamo un'istanza "vuota" bypassando l'init pesante
-        # __new__ alloca l'oggetto senza chiamare __init__
-        instance = cls.__new__(cls)
-        
-        # Ripristiniamo gli attributi dai metadati
-        instance.speakers = checkpoint['metadata']['speakers']
-        instance.data_root = Path(checkpoint['metadata']['data_root'])
-        instance.pose_tokenizer = pose_tokenizer
-        instance.text_tokenizer = text_tokenizer
-        
-        # Carichiamo i dati processati
-        instance.data = checkpoint['data']
-        
-        print(f"Dataset caricato con successo: {len(instance.data)} campioni.")
-        return instance
+    Args:
+        batch: lista di tuple (text_tokens, motion_tokens), 
+               text_tokens: Tensor[T_text], motion_tokens: Tensor[T_motion]
+
+    Returns:
+        Dict con:
+            - 'text_tokens': Tensor[B, T_text_max]
+            - 'motion_tokens': Tensor[B, T_motion_max]
+            - 'text_mask': Tensor[B, T_text_max] (1 = token reale, 0 = PAD)
+            - 'motion_mask': Tensor[B, T_motion_max] (1 = token reale, 0 = PAD)
+    """
+    text_seqs, motion_seqs = zip(*batch)  # unzip
+    text_seqs = list(text_seqs)
+    motion_seqs = list(motion_seqs)
+
+    # Padding dinamico per testo e motion
+    padded_texts = pad_sequence(text_seqs, batch_first=True, padding_value=0)    # PAD = 0
+    padded_motions = pad_sequence(motion_seqs, batch_first=True, padding_value=0) # PAD = 0
+
+    # Maschere (1 = token reale, 0 = PAD)
+    text_mask = (padded_texts == 0)
+    motion_mask = (padded_motions == 0)
+
+    return {
+        'text_tokens': padded_texts,       # [B, T_text_max]
+        'motion_tokens': padded_motions,   # [B, T_motion_max]
+        'text_mask': text_mask,            # [B, T_text_max]
+        'motion_mask': motion_mask         # [B, T_motion_max]
+    }
