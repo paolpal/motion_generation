@@ -1,6 +1,5 @@
 import os
 
-import optuna
 import wandb
 
 from motion_generation.embedding import Word2VecWeightFactory
@@ -10,24 +9,22 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import Optimizer, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from pathlib import Path
 from tqdm import tqdm
 
-from motion_generation.models import GestureTransformer
+from motion_generation.models import XGestureDecoder
 from motion_generation.dataset import TranscriptPoseDataset, transcript_motion_collate_fn
+
 
 from motion_quantization.models import SkeletonVQVAE
 from motion_quantization.quantization import PoseTokenizer
 from motion_generation.tokenizer import Word2VecTokenizer
 
-from typing import Optional, Union
-
 PRJ_ROOT = Path("/home/ubuntu/palumbo/Posemi/")
 WANDB_API_KEY = "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"
 
-
-def train_one_epoch(model:GestureTransformer, dataloader: DataLoader, optimizer: Optimizer, criterion: nn.Module, device: Optional[Union[torch.device, str]], epoch: int):
+def train_one_epoch(model, dataloader, optimizer: Optimizer, criterion, device, epoch):
     model.train()
     total_loss = 0.0
     
@@ -67,7 +64,7 @@ def train_one_epoch(model:GestureTransformer, dataloader: DataLoader, optimizer:
 
 
 @torch.no_grad()
-def validate(model: GestureTransformer, dataloader: DataLoader, criterion: nn.Module, device: Optional[Union[torch.device, str]]):
+def validate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0.0
     
@@ -93,133 +90,30 @@ def validate(model: GestureTransformer, dataloader: DataLoader, criterion: nn.Mo
     
     return total_loss / len(dataloader)
 
-def objective(trial):
+
+def main(config):
+
     hyperparams = {
         'max_seq_len': 500,
-        'batch_size': trial.suggest_categorical('batch_size', [8, 16, 32]),
-        'num_workers': 4,
-        'nhead': trial.suggest_categorical('nhead', [4, 6, 8]),
-        'encoder_layers': trial.suggest_int('encoder_layers', 2, 4, 6),
-        'decoder_layers': trial.suggest_int('decoder_layers', 2, 4),
-        'dim_feedforward': trial.suggest_categorical('dim_feedforward', [256, 512, 768, 1024]),
-        'dropout': trial.suggest_float('dropout', 0.1, 0.3),
-        'lr': trial.suggest_loguniform('lr', 1e-6, 1e-4),
-        'weight_decay': trial.suggest_loguniform('weight_decay', 1e-6, 1e-4),
-        'epochs': 100,
-        'look_ahead_steps': trial.suggest_int('look_ahead_steps', 1, 5),
-        'memory_causal': True
+        'batch_size': 32,
+        'nhead': 6,
+        'num_layers': 2,
+        'dim_feedforward': 512,
+        'dropout': 0.2,
+        'lr': 1e-6,
+        'weight_decay': 1e-5,
+        'look_ahead_steps': 9,
+        'context_back_steps': 45,
     }
 
     run = wandb.init(
-        project=config['study_name'], 
-        name=f"trial_{trial.number}",
-        config=hyperparams, 
+        project="gesture_transformer", 
+        config={**config, **hyperparams}, 
     )
 
-    train_loader = DataLoader(
-        GLOBAL_TRAIN,
-        batch_size=hyperparams['batch_size'],
-        shuffle=True,
-        collate_fn=transcript_motion_collate_fn,
-        num_workers=hyperparams['num_workers'],
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        GLOBAL_VAL,
-        batch_size=hyperparams['batch_size'],
-        shuffle=False,
-        collate_fn=transcript_motion_collate_fn,
-        num_workers=hyperparams['num_workers'],
-        pin_memory=True
-    )
-
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    text_embedding = factory.get_nn_embedding(freeze=True)
-
-    model = GestureTransformer(
-        text_embedding=text_embedding,
-        transcript_vocab_size=text_tokenizer.vocab_size,
-        pose_vocab_size=pose_tokenizer.vocab_size,
-        d_model=text_embedding.embedding_dim,
-        nhead=hyperparams['nhead'],
-        num_encoder_layers=hyperparams['encoder_layers'],
-        num_decoder_layers=hyperparams['decoder_layers'],
-        dim_feedforward=hyperparams['dim_feedforward'],
-        dropout=hyperparams['dropout'],
-        look_ahead_steps=hyperparams['look_ahead_steps'],
-        max_seq_len=hyperparams['max_seq_len'],
-        memory_causal=hyperparams['memory_causal']
-    ).to(device)
-
-    optimizer = AdamW(model.parameters(), lr=hyperparams['lr'], weight_decay=hyperparams['weight_decay'])
-    # scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
-    # CrossEntropy con ignore_index per ignorare i token di padding
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # PAD_TOKEN = 0
-
-    # Early Stopping params
-    patience = 15
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-
-    output_dir = Path(config['output_dir'])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        for epoch in range(1, hyperparams['epochs'] + 1):
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
-            val_loss = validate(model, val_loader, criterion, device)
-
-            scheduler.step()
-
-            run.log({
-                "Train Loss": train_loss,
-                "Val Loss": val_loss,
-                "Learning Rate": scheduler.get_last_lr()[0],
-            })
-
-            # Salva checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                epochs_no_improve = 0
-                model.save(output_dir / "best_model.pt")
-                print(f"New best model saved! Val Loss: {val_loss:.4f}")
-            else:
-                epochs_no_improve += 1
-
-            if epoch % config['save_every'] == 0:
-                print(f"Saving checkpoint at epoch {epoch}...")
-                model.save(output_dir / f"checkpoint.pt")
-
-            if epochs_no_improve >= patience:
-                print(f"Train stopped at epoch {epoch}")
-                break
-
-    finally:
-        run.finish()
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    return 0.0
-
-if __name__ == "__main__":
-    speakers = [ "almaram", "chemistry", "corden", "huckabee", "lec_evol", "maher", "oliver", "shelly", "ytch_prof",
-        "angelica",  "colbert", "ellen", "jon", "lec_hist", "minhaj", "rock", "ytch_charisma",
-        "bee", "conan", "fallon", "lec_cosmic", "lec_law", "noah", "seth", "ytch_dating"
-        ]
-    
-    config = {
-        'speakers': speakers,
-        'data_root': PRJ_ROOT / 'dataset/pats/data',
-        'pose_tokenizer_path': PRJ_ROOT / 'weights/vqvae/vqvae_trial_8.pt',
-        'text_tokenizer_path': PRJ_ROOT / 'caches/tokenizers/word2vec_tokenizer.json',
-        'caches_path': PRJ_ROOT / 'caches/dataset/',
-        'output_dir': PRJ_ROOT / 'weights/transformer/tuning/',
-        'save_every': 10,
-        'study_name': "gesture_transformer_hyperparam_tuning",
-    }
-
-    wandb.login(key=WANDB_API_KEY)
-
     # ===== 1. Carica Pose e Text Tokenizer e Text Embedding =====
 
     vqvae = SkeletonVQVAE.load(config['pose_tokenizer_path'])
@@ -227,31 +121,137 @@ if __name__ == "__main__":
     w2v = api.load("word2vec-google-news-300")
     text_tokenizer = Word2VecTokenizer.from_word2vec(w2v) #type:ignore
 
+    # 3. Crei il layer per il tuo Transformer
     factory = Word2VecWeightFactory(text_tokenizer, w2v)
-
-    GLOBAL_TRAIN = TranscriptPoseDataset(
+    text_embedding = factory.get_nn_embedding(freeze=True)
+    # ===== 2. Crea Dataset e DataLoader =====
+    print("Loading datasets...")
+    train_dataset = TranscriptPoseDataset(
         speakers=config['speakers'],
         data_root=config['data_root'],
         pose_tokenizer=pose_tokenizer,
         text_tokenizer=text_tokenizer,
         split="train",
         cache_path=config['caches_path'],
-        max_len=config['max_seq_len']
+        max_len=hyperparams['max_seq_len']
     )
     
-    GLOBAL_VAL = TranscriptPoseDataset(
+    val_dataset = TranscriptPoseDataset(
         speakers=config['speakers'],
         data_root=config['data_root'],
         pose_tokenizer=pose_tokenizer,
         text_tokenizer=text_tokenizer,
         split="dev",
         cache_path=config['caches_path'],
-        max_len=config['max_seq_len']
+        max_len=hyperparams['max_seq_len']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=hyperparams['batch_size'],
+        shuffle=True,
+        collate_fn=transcript_motion_collate_fn,
+        num_workers=config['num_workers'],
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=hyperparams['batch_size'],
+        shuffle=False,
+        collate_fn=transcript_motion_collate_fn,
+        num_workers=config['num_workers'],
+        pin_memory=True
     )
 
-    DB_NAME = f"sqlite:///{config['output_dir'] / (config['study_name'] + '.db')}"
-
-    study = optuna.create_study(study_name=config['study_name'], storage=DB_NAME, direction="minimize", 
-                                load_if_exists=True, pruner=optuna.pruners.MedianPruner(n_warmup_steps=10))
+    hyperparams = { **hyperparams,
+                   'pose_vocab_size': pose_tokenizer.vocab_size,
+                   'text_embedding': text_embedding,
+                   }
     
-    study.optimize(objective, n_trials=50)
+    # ===== 3. Crea Modello =====
+    print("Creating GestureTransformer model...")
+    model = XGestureDecoder(
+        **hyperparams
+    ).to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # ===== 4. Optimizer, Scheduler, Loss =====
+    optimizer = AdamW(model.parameters(), lr=hyperparams['lr'], weight_decay=hyperparams['weight_decay'])
+    # scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+    # CrossEntropy con ignore_index per ignorare i token di padding
+    criterion = nn.CrossEntropyLoss(ignore_index=0)  # PAD_TOKEN = 0
+    
+    # ===== 5. Training Loop =====
+    output_dir = Path(config['output_dir'])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    patience = 15
+    try:
+        for epoch in range(1, config['epochs'] + 1):
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch}/{config['epochs']}")
+            print(f"{'='*50}")
+            
+            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+            val_loss = validate(model, val_loader, criterion, device)
+            
+            scheduler.step()
+            
+            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Salva checkpoint
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                model.save(output_dir / "best_model.pt")
+                print(f"✓ New best model saved! Val Loss: {val_loss:.4f}")
+            else:
+                epochs_no_improve += 1
+            
+            # Salva checkpoint periodico
+            if epoch % config['save_every'] == 0:
+                print(f"Saving checkpoint at epoch {epoch}...")
+                model.save(output_dir / f"checkpoint.pt")
+            
+            if epochs_no_improve >= patience:
+                print(f"Train stopped at epoch {epoch}")
+                break
+
+            run.log({
+                "Train Loss": train_loss,
+                "Val Loss": val_loss,
+                "Learning Rate": scheduler.get_last_lr()[0],
+            })
+        
+        # Salva modello finale
+        # model.save(output_dir / "final_model.pt")
+        print(f"\nTraining completed! Best Val Loss: {best_val_loss:.4f}")
+    finally:
+        run.finish()
+
+
+if __name__ == "__main__":
+    speakers = [ "almaram", "chemistry", "corden", "huckabee", "lec_evol", "maher", "oliver", "shelly", "ytch_prof",
+        "angelica",  "colbert", "ellen", "jon", "lec_hist", "minhaj", "rock", "ytch_charisma",
+        "bee", "conan", "fallon", "lec_cosmic", "lec_law", "noah", "seth", "ytch_dating"
+        ]
+    config = {
+        'speakers': speakers,
+        'data_root': PRJ_ROOT / 'dataset/pats/data',          # Percorso ai dati
+        'pose_tokenizer_path': PRJ_ROOT / 'weights/vqvae/vqvae_trial_8.pt',
+        'text_tokenizer_path': PRJ_ROOT / 'caches/tokenizers/word2vec_tokenizer.json',
+        'caches_path': PRJ_ROOT / 'caches/dataset/',
+        'output_dir': PRJ_ROOT / 'weights/transformer/x_decoder/',
+        'num_workers': 4,
+        'epochs': 100,
+        'save_every': 10,
+    }
+
+    wandb.login(key=WANDB_API_KEY)
+
+    main(config)

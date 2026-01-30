@@ -8,8 +8,8 @@ import gensim.downloader as api
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim import Optimizer, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from pathlib import Path
 from tqdm import tqdm
 
@@ -24,7 +24,7 @@ from motion_generation.tokenizer import Word2VecTokenizer
 PRJ_ROOT = Path("/home/ubuntu/palumbo/Posemi/")
 WANDB_API_KEY = "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"
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch):
+def train_one_epoch(model, dataloader, optimizer: Optimizer, criterion, device, epoch):
     model.train()
     total_loss = 0.0
     
@@ -119,7 +119,8 @@ def main(config):
         pose_tokenizer=pose_tokenizer,
         text_tokenizer=text_tokenizer,
         split="train",
-        cache_path=config['caches_path']
+        cache_path=config['caches_path'],
+        max_len=config['max_seq_len']
     )
     
     val_dataset = TranscriptPoseDataset(
@@ -128,7 +129,8 @@ def main(config):
         pose_tokenizer=pose_tokenizer,
         text_tokenizer=text_tokenizer,
         split="dev",
-        cache_path=config['caches_path']
+        cache_path=config['caches_path'],
+        max_len=config['max_seq_len']
     )
     
     train_loader = DataLoader(
@@ -157,20 +159,21 @@ def main(config):
         pose_vocab_size=pose_tokenizer.vocab_size,
         d_model=text_embedding.embedding_dim,
         nhead=config['nhead'],
-        num_encoder_layers=config['num_layers'],
-        num_decoder_layers=config['num_layers'],
+        num_encoder_layers=config['encoder_layers'],
+        num_decoder_layers=config['decoder_layers'],
         dim_feedforward=config['dim_feedforward'],
         dropout=config['dropout'],
         look_ahead_steps=config['look_ahead_steps'],
-        max_seq_len=config['max_seq_len']
+        max_seq_len=config['max_seq_len'],
+        memory_causal=config['memory_causal']
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # ===== 4. Optimizer, Scheduler, Loss =====
     optimizer = AdamW(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
-    scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
-    
+    # scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=1e-6)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
     # CrossEntropy con ignore_index per ignorare i token di padding
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # PAD_TOKEN = 0
     
@@ -205,7 +208,8 @@ def main(config):
             
             # Salva checkpoint periodico
             if epoch % config['save_every'] == 0:
-                model.save(output_dir / f"checkpoint_epoch_{epoch}.pt")
+                print(f"Saving checkpoint at epoch {epoch}...")
+                model.save(output_dir / f"checkpoint.pt")
             
             if epochs_no_improve >= patience:
                 print(f"Train stopped at epoch {epoch}")
@@ -235,19 +239,21 @@ if __name__ == "__main__":
         'pose_tokenizer_path': PRJ_ROOT / 'weights/vqvae/vqvae_trial_8.pt',
         'text_tokenizer_path': PRJ_ROOT / 'caches/tokenizers/word2vec_tokenizer.json',
         'caches_path': PRJ_ROOT / 'caches/dataset/',
+        'output_dir': PRJ_ROOT / 'weights/transformer/test/',
         'max_seq_len': 500,
         'batch_size': 16,
         'num_workers': 4,
-        'nhead': 6,
-        'num_layers': 4,
-        'dim_feedforward': 768,
-        'dropout': 0.1,
-        'lr': 1e-4,
+        'nhead': 4,
+        'encoder_layers': 3,
+        'decoder_layers': 2,
+        'dim_feedforward': 512,
+        'dropout': 0.3,
+        'lr': 1e-5,
         'weight_decay': 1e-5,
         'epochs': 100,
-        'output_dir': PRJ_ROOT / 'weights/gesture_transformer/',
         'save_every': 10,
         'look_ahead_steps': 3,
+        'memory_causal': True
     }
 
     wandb.login(key=WANDB_API_KEY)
