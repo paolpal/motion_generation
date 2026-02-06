@@ -1651,14 +1651,14 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "gensim", specifier = ">=4.4.0" },
-    { name = "motion-quantization", editable = "../motion_quantization" },
+    { name = "motion-quantization", directory = "../motion_quantization" },
     { name = "x-transformers", specifier = ">=2.14.2" },
 ]
 
 [[package]]
 name = "motion-quantization"
 version = "0.1.0"
-source = { editable = "../motion_quantization" }
+source = { directory = "../motion_quantization" }
 dependencies = [
     { name = "argparse" },
     { name = "faster-whisper" },

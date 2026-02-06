@@ -4,7 +4,7 @@ import random
 import wandb
 
 from motion_generation.embedding import Word2VecWeightFactory
-os.environ["GENSIM_DATA_DIR"] = "/home/ubuntu/palumbo/Posemi/dataset/gensim_data"
+# os.environ["GENSIM_DATA_DIR"] = "/home/ubuntu/palumbo/Posemi/dataset/gensim_data"
 import gensim.downloader as api
 import torch
 from pathlib import Path
@@ -23,7 +23,7 @@ from motion_generation.scripts.render_video import render_video
 from torch.nn.utils.rnn import pad_sequence
 from motion_generation.scripts.save_attn import save_attention_heatmap, save_attention_subplots 
 
-PRJ_ROOT = Path("/home/ubuntu/palumbo/Posemi/")
+PRJ_ROOT = Path("/home/paolo/Projects/Posemi")
 
 @torch.no_grad()
 def main(config):
@@ -166,7 +166,7 @@ if __name__ == "__main__":
     speakers = [ "almaram", "chemistry", "corden", "huckabee", "lec_evol", "maher", "oliver", "shelly", "ytch_prof",
         "angelica",  "colbert", "ellen", "jon", "lec_hist", "minhaj", "rock", "ytch_charisma",
         "bee", "conan", "fallon", "lec_cosmic", "lec_law", "noah", "seth", "ytch_dating"
-        ]
+    ]
     
     config = {
         'speakers': speakers,

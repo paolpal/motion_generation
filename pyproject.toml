@@ -21,4 +21,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.uv.sources]
-motion-quantization = { path = "../motion_quantization", editable = true }
+motion-quantization = { path = "../motion_quantization" }
